@@ -276,4 +276,4 @@ MIT License
 
 ---
 
-Developed by [MARVGAME](https://github.com/MARVserver)
+Developed by [MARVserver](https://github.com/MARVserver)
