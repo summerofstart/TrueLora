@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "TrueLora Team"},
+    {name = "MARVGAME"},
 ]
 keywords = ["lora", "adapter", "peft", "nlp", "transfer-learning"]
 classifiers = [
