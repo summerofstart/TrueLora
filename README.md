@@ -57,11 +57,39 @@ Text Prompt
 ## Key Features
 
 - **Zero-Shot Adaptation**: Generate LoRA adapters for new tasks without fine-tuning
+- **Semantic Text Encoder**: Multilingual sentence embeddings (with an offline hashing fallback) so cross-lingual descriptions like `"binary search"` and `"二分探索"` retrieve the same adapters
+- **Conditioned Hypernetwork**: A shared trunk conditioned on `(task, layer, module)` whose parameters scale with the number of *module types*, not the number of layers — ~28× smaller than a flat generator on a 28-layer model
 - **Uncertainty Estimation**: Know when the generated adapter is reliable
 - **Quality Gating**: Automatically accept/reject adapters based on confidence
 - **PEFT Compatible**: Export to standard HuggingFace PEFT format
 - **Batch Processing**: Optimized tensor operations for high throughput
 - **Reproducibility**: Deterministic generation with seed control
+
+### Semantic Encoder + Conditioned Hypernetwork
+
+The default `HashingTextEncoder` + flat `HyperAdapter` remain the backward-compatible
+baseline. To opt into the stronger Text-to-LoRA-style stack:
+
+```python
+from true_lora import SemanticTextEncoder, TrueLoraGenerator
+
+encoder = SemanticTextEncoder()  # multilingual SBERT; falls back to hashing if offline
+# Build the AdapterBank with the SAME encoder so retrieval embeddings match:
+#   AdapterSpec(desc, encoder.encode(desc), tensors, ...)
+
+model = TrueLoraGenerator(
+    specs,
+    bank,
+    hidden_dim=512,
+    encoder=encoder,           # semantic embeddings drive both retrieval and generation
+    hyper_kind="conditioned",  # shared, (task, layer, module)-conditioned hypernetwork
+)
+```
+
+The conditioned hypernetwork parses each `LoraTensorSpec` name into a `(layer index,
+module type)` pair: the same module type at different layers shares an output head and
+a module embedding, differing only via a per-layer embedding. This is what keeps the
+parameter count flat as model depth grows.
 
 ## Installation
 
@@ -201,6 +229,37 @@ report = gate_adapter(state_dict, eval_report, gate=gate)
 if report["accepted"]:
     # Adapter is ready for deployment
     pass
+```
+
+### Reliability: Calibration, Selective Prediction & Abstention
+
+A text-to-LoRA hypernetwork always emits *something* — when the task description is
+out of distribution it silently produces a low-quality adapter. True-LoRA's
+differentiator is reporting **when it does not know**:
+
+- **Calibration (ECE/MCE)** — is a confidence of 0.8 actually right 80% of the time?
+  A `HistogramBinningCalibrator` re-maps raw confidence to empirical accuracy.
+- **Selective prediction (risk-coverage / AURC)** — answer only the most confident
+  fraction and measure the residual risk; a good confidence signal yields low risk
+  at high coverage.
+- **Abstention** — contrast the risk of answered vs abstained samples to confirm the
+  OOD abstain path catches the bad ones.
+
+```python
+from true_lora.reliability import reliability_report_for_adapters
+
+report = reliability_report_for_adapters(model, adapters, tolerance=0.02, calibrate=True)
+print(report["ece"], report["calibrated_ece"])         # raw vs calibrated
+print(report["aurc"], report["selective_risk"])        # selective generation
+print(report["abstention"])                            # answered vs abstained risk
+```
+
+From the CLI, generate a reliability report and gate on it:
+
+```bash
+true-lora reliability --manifest adapters.jsonl --checkpoint ckpt.pt --report-out rel.json
+true-lora gate --adapter generated.pt --reliability-report rel.json \
+  --max-ece 0.1 --max-aurc 0.05 --max-selective-risk 0.02
 ```
 
 ### Prompt Consistency Analysis

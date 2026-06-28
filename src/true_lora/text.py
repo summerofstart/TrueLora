@@ -32,3 +32,60 @@ class HashingTextEncoder:
             vector[bucket] += sign
 
         return F.normalize(vector, dim=0)
+
+
+DEFAULT_SEMANTIC_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+
+class SemanticTextEncoder:
+    """Semantic sentence embeddings with a deterministic hashing fallback.
+
+    Uses sentence-transformers when available (defaulting to a multilingual model
+    so cross-lingual descriptions such as "binary search" and "二分探索" land near
+    each other). When the library or model weights are unavailable -- offline CI,
+    minimal installs -- it transparently falls back to :class:`HashingTextEncoder`
+    so callers keep a working, deterministic encoder.
+
+    All vectors are L2-normalized, matching the cosine-similarity contract that
+    :class:`~true_lora.adapter.AdapterBank` relies on.
+    """
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_SEMANTIC_MODEL,
+        device: str = "cpu",
+        fallback_dim: int = 256,
+    ) -> None:
+        self._model = None
+        self._fallback: HashingTextEncoder | None = None
+        self._cache: dict[str, torch.Tensor] = {}
+        self.requested_model = model_name
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(model_name, device=device)
+            self.dim = int(self._model.get_sentence_embedding_dimension())
+            self.backend = "sentence-transformers"
+            self.model_name: str | None = model_name
+        except Exception:
+            # Library missing or weights cannot be fetched -> stay usable offline.
+            self._fallback = HashingTextEncoder(dim=fallback_dim)
+            self.dim = fallback_dim
+            self.backend = "hashing-fallback"
+            self.model_name = None
+
+    def encode(self, text: str) -> torch.Tensor:
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached.clone()
+
+        if self._model is not None:
+            vector = self._model.encode(text, convert_to_numpy=False, normalize_embeddings=True)
+            vector = torch.as_tensor(vector, dtype=torch.float32).detach().cpu()
+            vector = F.normalize(vector, dim=0)
+        else:
+            assert self._fallback is not None
+            vector = self._fallback.encode(text)
+
+        self._cache[text] = vector
+        return vector.clone()

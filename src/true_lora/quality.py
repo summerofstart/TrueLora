@@ -13,6 +13,10 @@ class QualityGate:
     max_consistency_mse: float | None = None
     min_prompt_sensitivity_mse: float | None = None
     min_retrieval_score_delta: float | None = None
+    max_ece: float | None = None
+    max_aurc: float | None = None
+    max_selective_risk: float | None = None
+    selective_risk_coverage: str = "coverage_0.8"
 
 
 def tensor_norm_report(state_dict: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -36,6 +40,7 @@ def gate_adapter(
     generation_report: dict[str, float] | None = None,
     consistency_report: dict[str, float] | None = None,
     sensitivity_report: dict[str, float] | None = None,
+    reliability_report: dict[str, object] | None = None,
     gate: QualityGate | None = None,
 ) -> dict[str, float | bool | str]:
     gate = gate or QualityGate()
@@ -45,6 +50,11 @@ def gate_adapter(
     consistency_mse = float((consistency_report or {}).get("mean_pairwise_mse", 0.0))
     sensitivity_mse = float((sensitivity_report or {}).get("mean_control_mse", 0.0))
     retrieval_score_delta = float((sensitivity_report or {}).get("mean_retrieval_score_delta", 0.0))
+    reliability = reliability_report or {}
+    ece = float(reliability.get("ece", 0.0))
+    aurc = float(reliability.get("aurc", 0.0))
+    selective = reliability.get("selective_risk", {}) or {}
+    selective_risk = float(selective.get(gate.selective_risk_coverage, 0.0)) if isinstance(selective, dict) else 0.0
 
     failures: list[str] = []
     if accuracy_delta < gate.min_accuracy_delta:
@@ -59,6 +69,12 @@ def gate_adapter(
         failures.append("prompt_sensitivity_mse")
     if gate.min_retrieval_score_delta is not None and retrieval_score_delta < gate.min_retrieval_score_delta:
         failures.append("retrieval_score_delta")
+    if gate.max_ece is not None and ece > gate.max_ece:
+        failures.append("ece")
+    if gate.max_aurc is not None and aurc > gate.max_aurc:
+        failures.append("aurc")
+    if gate.max_selective_risk is not None and selective_risk > gate.max_selective_risk:
+        failures.append("selective_risk")
 
     return {
         "accepted": not failures,
@@ -68,5 +84,8 @@ def gate_adapter(
         "mean_pairwise_mse": consistency_mse,
         "mean_control_mse": sensitivity_mse,
         "mean_retrieval_score_delta": retrieval_score_delta,
+        "ece": ece,
+        "aurc": aurc,
+        "selective_risk": selective_risk,
         **norms,
     }

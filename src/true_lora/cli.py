@@ -24,6 +24,7 @@ from true_lora.generator import TrueLoraGenerator, load_true_lora_checkpoint
 from true_lora.hf_eval import evaluate_hf_causal_lm_generation, evaluate_hf_sequence_classification
 from true_lora.peft_io import inspect_peft_directory
 from true_lora.quality import QualityGate, gate_adapter
+from true_lora.reliability import reliability_report_for_adapters
 from true_lora.repro import set_seed
 from true_lora.reporting import (
     audit_reports,
@@ -253,12 +254,15 @@ def gate(args: argparse.Namespace) -> None:
     consistency_report = _nested_report(consistency_payload) if consistency_payload else None
     sensitivity_payload = load_json_report(args.sensitivity_report) if args.sensitivity_report else None
     sensitivity_report = _nested_report(sensitivity_payload) if sensitivity_payload else None
+    reliability_payload = load_json_report(args.reliability_report) if args.reliability_report else None
+    reliability_report = _nested_report(reliability_payload) if reliability_payload else None
     report = gate_adapter(
         state_dict,
         eval_report,
         generation_report=generation_report,
         consistency_report=consistency_report,
         sensitivity_report=sensitivity_report,
+        reliability_report=reliability_report,
         gate=QualityGate(
             min_accuracy_delta=args.min_accuracy_delta,
             max_uncertainty=args.max_uncertainty,
@@ -266,6 +270,10 @@ def gate(args: argparse.Namespace) -> None:
             max_consistency_mse=args.max_consistency_mse,
             min_prompt_sensitivity_mse=args.min_prompt_sensitivity_mse,
             min_retrieval_score_delta=args.min_retrieval_score_delta,
+            max_ece=args.max_ece,
+            max_aurc=args.max_aurc,
+            max_selective_risk=args.max_selective_risk,
+            selective_risk_coverage=args.selective_risk_coverage,
         ),
     )
     combined = {**eval_report, **generation_report, **(consistency_report or {}), **(sensitivity_report or {}), **report}
@@ -507,6 +515,42 @@ def prompt_sensitivity(args: argparse.Namespace) -> None:
     print(payload)
 
 
+def reliability(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    text_dim = checkpoint_text_dim(args.checkpoint, args.text_dim)
+    encoder = HashingTextEncoder(dim=text_dim)
+    specs, bank, adapters = load_adapter_manifest(args.manifest, encoder)
+    if args.checkpoint:
+        model, _ = load_true_lora_checkpoint(
+            args.checkpoint,
+            bank,
+            expected_specs=specs,
+            ood_shrink_factor=args.ood_shrink_factor,
+        )
+    else:
+        model = TrueLoraGenerator(
+            specs,
+            bank,
+            text_dim=args.text_dim,
+            hidden_dim=args.hidden_dim,
+            max_tensor_norm=args.max_norm,
+            ood_shrink_factor=args.ood_shrink_factor,
+        )
+    report = reliability_report_for_adapters(
+        model,
+        adapters,
+        tolerance=args.tolerance,
+        retrieval_k=args.k,
+        retrieval_metric=args.retrieval_metric,
+        metric_weight=args.metric_weight,
+        min_retrieval_score=args.min_retrieval_score,
+        calibrate=not args.no_calibrate,
+    )
+    payload = {"command": "reliability", "manifest": args.manifest, "seed": args.seed, "report": report}
+    maybe_write_report(args.report_out, payload)
+    print(payload)
+
+
 def pipeline(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     text_dim = checkpoint_text_dim(args.checkpoint, args.text_dim)
@@ -711,6 +755,11 @@ def main() -> None:
     gate_parser.add_argument("--sensitivity-report", type=Path)
     gate_parser.add_argument("--min-prompt-sensitivity-mse", type=float)
     gate_parser.add_argument("--min-retrieval-score-delta", type=float)
+    gate_parser.add_argument("--reliability-report", type=Path)
+    gate_parser.add_argument("--max-ece", type=float)
+    gate_parser.add_argument("--max-aurc", type=float)
+    gate_parser.add_argument("--max-selective-risk", type=float)
+    gate_parser.add_argument("--selective-risk-coverage", default="coverage_0.8")
     gate_parser.add_argument("--benchmark", type=Path)
     gate_parser.add_argument("--module", default="layer")
     gate_parser.add_argument("--hf-benchmark", type=Path)
@@ -843,6 +892,23 @@ def main() -> None:
     sensitivity_parser.add_argument("--seed", type=int)
     sensitivity_parser.add_argument("--report-out", type=Path)
     sensitivity_parser.set_defaults(func=prompt_sensitivity)
+
+    reliability_parser = sub.add_parser("reliability")
+    reliability_parser.add_argument("--manifest", type=Path, required=True)
+    reliability_parser.add_argument("--checkpoint", type=Path)
+    reliability_parser.add_argument("--tolerance", type=float, default=0.05)
+    reliability_parser.add_argument("--k", type=int, default=4)
+    reliability_parser.add_argument("--text-dim", type=int, default=256)
+    reliability_parser.add_argument("--hidden-dim", type=int, default=512)
+    reliability_parser.add_argument("--max-norm", type=float, default=4.0)
+    reliability_parser.add_argument("--retrieval-metric")
+    reliability_parser.add_argument("--metric-weight", type=float, default=0.0)
+    reliability_parser.add_argument("--min-retrieval-score", type=float)
+    reliability_parser.add_argument("--ood-shrink-factor", type=float, default=0.25)
+    reliability_parser.add_argument("--no-calibrate", action="store_true")
+    reliability_parser.add_argument("--seed", type=int)
+    reliability_parser.add_argument("--report-out", type=Path)
+    reliability_parser.set_defaults(func=reliability)
 
     pipeline_parser = sub.add_parser("pipeline")
     pipeline_parser.add_argument("--manifest", type=Path, required=True)
