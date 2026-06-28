@@ -1,0 +1,5 @@
+{"description": "code generation python javascript typescript", "path": "outputs/training_adapters/adapter_00.pt", "metrics": {"score": 0.72}}
+{"description": "japanese translation polite casual business", "path": "outputs/training_adapters/adapter_01.pt", "metrics": {"score": 0.48}}
+{"description": "creative writing storytelling narrative prose", "path": "outputs/training_adapters/adapter_02.pt", "metrics": {"score": 0.61}}
+{"description": "scientific explanation physics chemistry biology", "path": "outputs/training_adapters/adapter_03.pt", "metrics": {"score": 0.55}}
+{"description": "chat conversation question answering dialogue", "path": "outputs/training_adapters/adapter_04.pt", "metrics": {"score": 0.65}}

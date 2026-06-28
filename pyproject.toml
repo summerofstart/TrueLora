@@ -1,0 +1,18 @@
+[project]
+name = "true-lora"
+version = "0.1.0"
+description = "A retrieval-grounded, uncertainty-aware Text-to-LoRA prototype."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.0",
+]
+
+[project.scripts]
+true-lora = "true_lora.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
