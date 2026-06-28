@@ -181,7 +181,7 @@ class TrueLoraGenerator:
     def __init__(
         self,
         tensor_specs: list[LoraTensorSpec],
-        adapter_bank: AdapterBank,
+        adapter_bank: AdapterBank | None = None,
         text_dim: int = 256,
         hidden_dim: int = 512,
         max_tensor_norm: float = 1.0,
@@ -233,6 +233,27 @@ class TrueLoraGenerator:
         min_retrieval_score: float | None = None,
     ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, object]]:
         embedding = self.encoder.encode(prompt)
+
+        # Bankless (pure text-to-LoRA) mode: no retrieval database, the hypernetwork
+        # alone maps the prompt to a LoRA. Used when no adapter bank is provided.
+        if self.adapter_bank is None:
+            generated, generator_uncertainty = self.hyper(embedding)
+            uncertainty = min(1.0, generator_uncertainty)
+            generated_only = {name: self._clip_norm(delta) for name, delta in generated.items()}
+            report = {
+                "uncertainty": uncertainty,
+                "retrieval_uncertainty": 0.0,
+                "generator_uncertainty": generator_uncertainty,
+                "generated_weight": 1.0,
+                "metric_weight": metric_weight,
+                "max_retrieval_score": float("nan"),
+                "min_retrieval_score": float(min_retrieval_score) if min_retrieval_score is not None else float("nan"),
+                "abstained": 0.0,
+                "shrink_factor": 1.0,
+                "retrieved_adapters": [],
+            }
+            return {"blended": dict(generated_only), "retrieval": {}, "generated": generated_only}, report
+
         # Use single score computation (avoids double scoring)
         retrieved_adapters, retrieval_weights, all_scores = self.adapter_bank.retrieve_with_max_score(
             embedding,

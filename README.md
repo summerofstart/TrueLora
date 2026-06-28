@@ -262,6 +262,33 @@ true-lora gate --adapter generated.pt --reliability-report rel.json \
   --max-ece 0.1 --max-aurc 0.05 --max-selective-risk 0.02
 ```
 
+### End-to-End SFT (train through a real downstream loss)
+
+Reconstruction (`train_on_adapter_bank`) teaches the hypernetwork to *copy* example
+LoRA weights. The stronger objective is end-to-end SFT: generate a LoRA, apply it to
+a frozen base model, compute the downstream loss, and backpropagate through the
+hypernetwork so it learns to produce LoRAs that actually *solve* the task.
+
+This needs a **differentiable** LoRA application (the in-place merge runs under
+`no_grad`). `LoraSFTModel` attaches forward hooks that add `(x @ Aᵀ) @ Bᵀ · (α/r)`
+to each target linear, keeping the generated `A`/`B` in the autograd graph.
+
+```python
+from true_lora.sft import sft_train_hypernetwork, causal_lm_loss
+
+# examples: list of (prompt, payload); payload is whatever your loss_fn consumes.
+losses = sft_train_hypernetwork(
+    generator,                 # provides .encoder and .hyper (trained in place)
+    base_model,                # frozen; exposes the LoRA target nn.Linear modules
+    examples=[("write a haiku", batch), ...],
+    loss_fn=causal_lm_loss,    # HF causal LM: returns model(**batch).loss
+    steps=300, lr=1e-3,
+)
+```
+
+For lower-level control, `LoraSFTModel(base_model, specs)` is a context manager:
+`set_adapter(generated_state_dict)` before each forward, then read `base_model(...)`.
+
 ### Prompt Consistency Analysis
 
 Evaluate how consistent the adapter generation is across similar prompts:

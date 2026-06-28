@@ -31,6 +31,7 @@ from true_lora.reliability import (
     selective_risk_at_coverage,
 )
 from true_lora.repro import set_seed
+from true_lora.sft import LoraSFTModel, causal_lm_loss, sft_train_hypernetwork
 from true_lora.reporting import audit_reports, compare_reports, load_audit_profile, load_json_report, write_json_report
 from true_lora.sensitivity import PromptContrast, load_prompt_contrasts, prompt_sensitivity_report
 from true_lora.train import ablation_report
@@ -85,4 +86,7 @@ __all__ = [
     "reliability_report",
     "collect_generation_records",
     "reliability_report_for_adapters",
+    "LoraSFTModel",
+    "sft_train_hypernetwork",
+    "causal_lm_loss",
 ]
