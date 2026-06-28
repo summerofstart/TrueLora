@@ -1,68 +1,69 @@
 # True-LoRA
 
-**Retrieval-Grounded, Uncertainty-Aware Text-to-LoRA Generation**
+**Reliable, Uncertainty-Aware Text-to-LoRA Generation**
 
 Developed by [MARVserver](https://github.com/MARVserver)
 
-True-LoRA is a framework that generates LoRA (Low-Rank Adaptation) adapters directly from text prompts, enabling on-the-fly model customization without fine-tuning. It combines retrieval-based adapter blending with neural generation, providing uncertainty estimates for quality control.
+True-LoRA is a framework that generates LoRA (Low-Rank Adaptation) adapters directly from text prompts, enabling on-the-fly model customization without per-task fine-tuning. It runs as pure text-to-LoRA or with optional retrieval grounding, trains by reconstruction or end-to-end SFT, and reports calibrated confidence so you know when to trust — or abstain from — a generated adapter.
 
 ## Overview
 
-Traditional LoRA adapters require expensive fine-tuning for each task. True-LoRA takes a different approach:
+Traditional LoRA adapters require expensive fine-tuning for each task. True-LoRA
+generates a LoRA from a text prompt in a single forward pass. The hypernetwork can
+run **bankless** (pure text-to-LoRA, no retrieval database) or **retrieval-grounded**
+(blend in the nearest adapters from a bank), and it can be trained two ways:
 
-1. **Adapter Bank**: Store pre-trained LoRA adapters with text descriptions
-2. **Retrieval**: Given a new prompt, find the most relevant adapters via semantic search
-3. **Blending**: Combine retrieved adapters using learned interpolation weights
-4. **Generation**: Generate new adapter tensors via a hypernetwork conditioned on the prompt
-5. **Uncertainty**: Estimate confidence in the generated adapter for quality gating
+1. **Semantic encoding**: Embed the prompt with a multilingual sentence encoder (with an offline hashing fallback)
+2. **Generation**: A `(task, layer, module)`-conditioned hypernetwork emits the LoRA directly
+3. **(Optional) Retrieval grounding**: Blend in the nearest adapters from a bank, weighted by similarity
+4. **Uncertainty & reliability**: Estimate confidence, calibrate it (ECE), and abstain / gate on it
+5. **Training**: Reconstruction (copy example LoRAs) **or** end-to-end SFT (apply the LoRA to a frozen base model and backpropagate the downstream loss)
 
-This enables instant adaptation of large language models to new tasks without any fine-tuning.
+This enables instant adaptation of large language models to new tasks without
+per-task fine-tuning.
 
 ## Architecture
 
 ```
-Text Prompt
-    │
-    ▼
-┌─────────────────┐
-│ Text Encoder    │  (Feature Hashing)
-│ (HashingText)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌─────────────────┐
-│ Adapter Bank    │────▶│ Retrieval       │
-│ (Pre-trained)   │     │ (Top-K Search)  │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│ HyperAdapter    │     │ Interpolation   │
-│ (Neural Net)    │     │ (Weighted Blend)│
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────────────────────────────┐
-│            Blending Layer               │
-│  (Uncertainty-Weighted Combination)     │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-         ┌───────────────┐
-         │  LoRA Adapter │
-         │  (Output)     │
-         └───────────────┘
+                         Text Prompt
+                              │
+                  ┌───────────▼────────────┐
+                  │ SemanticTextEncoder     │  (multilingual; hashing fallback)
+                  └───────────┬────────────┘
+              ┌───────────────┴───────────────┐
+              ▼                                ▼
+  ┌─────────────────────┐        ┌──────────────────────────┐
+  │ ConditionedHyper-   │        │ Adapter Bank (optional)   │
+  │ Adapter (task,layer,│        │  Retrieval → Interpolation│
+  │ module)             │        │  (skipped when bankless)  │
+  └──────────┬──────────┘        └─────────────┬────────────┘
+             └───────────────┬─────────────────┘
+                             ▼
+              ┌──────────────────────────────┐
+              │ Uncertainty-weighted blend   │
+              │ + norm clip (+ OOD abstain)  │
+              └──────────────┬───────────────┘
+                             ▼
+                     ┌───────────────┐
+                     │  LoRA Adapter │  (PEFT-compatible)
+                     └───────────────┘
+
+Training: reconstruction (copy example LoRAs)  │  end-to-end SFT
+          via train_on_adapter_bank            │  via sft_train_hypernetwork
+                                               │  (differentiable LoRA application,
+                                               │   downstream loss → hypernetwork)
 ```
 
 ## Key Features
 
 - **Zero-Shot Adaptation**: Generate LoRA adapters for new tasks without fine-tuning
-- **Semantic Text Encoder**: Multilingual sentence embeddings (with an offline hashing fallback) so cross-lingual descriptions like `"binary search"` and `"二分探索"` retrieve the same adapters
+- **Bankless or Retrieval-Grounded**: Run as pure text-to-LoRA (`adapter_bank=None`) or blend in retrieved neighbors from an adapter bank
+- **Semantic Text Encoder**: Multilingual sentence embeddings (with an offline hashing fallback) so cross-lingual descriptions like `"binary search"` and `"二分探索"` land near each other
 - **Conditioned Hypernetwork**: A shared trunk conditioned on `(task, layer, module)` whose parameters scale with the number of *module types*, not the number of layers — ~28× smaller than a flat generator on a 28-layer model
-- **Uncertainty Estimation**: Know when the generated adapter is reliable
-- **Quality Gating**: Automatically accept/reject adapters based on confidence
+- **End-to-End SFT**: Train the hypernetwork through a differentiable LoRA application and a real downstream loss, not just weight reconstruction
+- **Calibrated Reliability**: ECE/MCE, risk-coverage/AURC selective prediction, and an OOD abstain path — know when to trust or abstain
+- **Quality Gating**: Automatically accept/reject adapters based on confidence and reliability thresholds
 - **PEFT Compatible**: Export to standard HuggingFace PEFT format
-- **Batch Processing**: Optimized tensor operations for high throughput
 - **Reproducibility**: Deterministic generation with seed control
 
 ### Semantic Encoder + Conditioned Hypernetwork
@@ -74,16 +75,20 @@ baseline. To opt into the stronger Text-to-LoRA-style stack:
 from true_lora import SemanticTextEncoder, TrueLoraGenerator
 
 encoder = SemanticTextEncoder()  # multilingual SBERT; falls back to hashing if offline
-# Build the AdapterBank with the SAME encoder so retrieval embeddings match:
-#   AdapterSpec(desc, encoder.encode(desc), tensors, ...)
 
+# Bankless: pure text-to-LoRA, no retrieval database.
 model = TrueLoraGenerator(
     specs,
-    bank,
+    adapter_bank=None,         # omit the bank entirely
     hidden_dim=512,
-    encoder=encoder,           # semantic embeddings drive both retrieval and generation
+    encoder=encoder,           # semantic embeddings drive generation
     hyper_kind="conditioned",  # shared, (task, layer, module)-conditioned hypernetwork
 )
+state_dict, report = model.generate("write a fast vectorized numpy function")
+
+# Retrieval-grounded: pass an AdapterBank built with the SAME encoder
+#   AdapterSpec(desc, encoder.encode(desc), tensors, ...)
+# model = TrueLoraGenerator(specs, bank, encoder=encoder, hyper_kind="conditioned")
 ```
 
 The conditioned hypernetwork parses each `LoraTensorSpec` name into a `(layer index,
@@ -102,8 +107,25 @@ pip install -e .
 - Python >= 3.10
 - PyTorch >= 2.0
 - transformers (optional, for HuggingFace model evaluation)
+- sentence-transformers (optional, for the multilingual semantic encoder)
 
 ## Quick Start
+
+### Bankless generation (Python)
+
+The simplest path — no adapter bank, no manifest. Train the hypernetwork on a few
+`(description → LoRA)` pairs, then generate from any prompt. See
+[`notebooks/matutake_coding_lora_tutorial.ipynb`](notebooks/matutake_coding_lora_tutorial.ipynb)
+for a full, runnable Colab playground.
+
+```python
+from true_lora import TrueLoraGenerator, SemanticTextEncoder, train_on_adapter_bank
+
+encoder = SemanticTextEncoder()
+model = TrueLoraGenerator(specs, adapter_bank=None, encoder=encoder, hyper_kind="conditioned")
+train_on_adapter_bank(model, adapters, steps=200)         # (description -> LoRA) pairs
+state_dict, report = model.generate("write a fast vectorized numpy function")
+```
 
 ### 1. Demo Command
 
@@ -324,16 +346,18 @@ true-lora/
 │   ├── benchmark.py         # Benchmarking utilities
 │   ├── cli.py               # Command-line interface
 │   ├── consistency.py       # Prompt consistency analysis
-│   ├── generator.py         # TrueLoraGenerator (core)
+│   ├── generator.py         # TrueLoraGenerator + conditioned hypernetwork (core)
 │   ├── hf_eval.py           # HuggingFace model evaluation
 │   ├── peft_io.py           # PEFT format I/O
 │   ├── quality.py           # Quality gating
+│   ├── reliability.py       # Calibration (ECE), selective prediction, abstention
 │   ├── reporting.py         # JSON report utilities
 │   ├── repro.py             # Reproducibility (seed control)
 │   ├── sensitivity.py       # Prompt sensitivity analysis
-│   ├── text.py              # Text encoding (feature hashing)
+│   ├── sft.py               # End-to-end SFT (differentiable LoRA application)
+│   ├── text.py              # Text encoding (hashing + semantic encoder)
 │   ├── toy_eval.py          # Toy evaluation tasks
-│   └── train.py             # Training loop and evaluation
+│   └── train.py             # Reconstruction training loop and evaluation
 ├── tests/
 │   ├── test_true_lora.py    # Unit tests
 │   └── smoke.py             # Integration smoke tests

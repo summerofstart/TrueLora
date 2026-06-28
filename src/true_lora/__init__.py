@@ -34,7 +34,7 @@ from true_lora.repro import set_seed
 from true_lora.sft import LoraSFTModel, causal_lm_loss, sft_train_hypernetwork
 from true_lora.reporting import audit_reports, compare_reports, load_audit_profile, load_json_report, write_json_report
 from true_lora.sensitivity import PromptContrast, load_prompt_contrasts, prompt_sensitivity_report
-from true_lora.train import ablation_report
+from true_lora.train import ablation_report, train_on_adapter_bank
 
 __all__ = [
     "AdapterBank",
@@ -78,6 +78,7 @@ __all__ = [
     "load_prompt_contrasts",
     "prompt_sensitivity_report",
     "ablation_report",
+    "train_on_adapter_bank",
     "expected_calibration_error",
     "risk_coverage_points",
     "area_under_risk_coverage",
