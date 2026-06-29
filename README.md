@@ -117,7 +117,9 @@ pip install -e .
 The simplest path — no adapter bank, no manifest. Train the hypernetwork on a few
 `(description → LoRA)` pairs, then generate from any prompt. See
 [`notebooks/matutake_coding_lora_tutorial.ipynb`](notebooks/matutake_coding_lora_tutorial.ipynb)
-for a full, runnable Colab playground.
+for a full, runnable Colab playground, and
+[`notebooks/cot_think_compare.ipynb`](notebooks/cot_think_compare.ipynb) for `<think>`-tag
+chain-of-thought with a base-vs-adapted comparison (toggling a generated LoRA on the same model).
 
 ```python
 from true_lora import TrueLoraGenerator, SemanticTextEncoder, train_on_adapter_bank
