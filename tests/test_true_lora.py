@@ -396,3 +396,31 @@ def test_distribution_anchors_lower_confidence_on_ood():
     assert cleared["novelty"] == 0.0
     import math
     assert math.isnan(cleared["max_anchor_similarity"])
+
+
+def test_anchors_do_not_change_blended_adapter_only_confidence():
+    # Regression: the novelty signal must inform the reported confidence ONLY, never
+    # the produced adapter. Folding it into the retrieval blend weight previously
+    # shifted retrieval-vs-generation and could lower accuracy on slightly-novel prompts.
+    encoder = HashingTextEncoder(dim=32)
+    specs = make_gqa_specs([0, 6])
+    bank, adapters = make_conditioned_bank(specs, encoder)
+    model = TrueLoraGenerator(
+        specs, bank, text_dim=32, hidden_dim=32, max_tensor_norm=4.0,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    prompt = "an unrelated out-of-distribution prompt zzz"
+
+    before, rep_before = model.generate(prompt, retrieval_k=2)
+    model.set_distribution_anchors(adapters)
+    after, rep_after = model.generate(prompt, retrieval_k=2)
+
+    # The prompt is novel, so the reported uncertainty rises...
+    assert rep_after["novelty"] > 0.0
+    assert rep_after["uncertainty"] >= rep_before["uncertainty"] - 1e-9
+    # ...but the blend weight and the produced adapter are byte-for-byte unchanged.
+    assert abs(rep_before["generated_weight"] - rep_after["generated_weight"]) < 1e-9
+    assert rep_after["blend_uncertainty"] == rep_before["blend_uncertainty"]
+    assert set(before) == set(after)
+    for key in before:
+        assert torch.allclose(before[key], after[key], atol=1e-6)

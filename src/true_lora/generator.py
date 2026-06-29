@@ -318,11 +318,15 @@ class TrueLoraGenerator:
         retrieved, retrieval_uncertainty = self.adapter_bank.interpolate_retrieved(retrieved_adapters, retrieval_weights)
         generated, generator_uncertainty = self.hyper(embedding)
 
+        # The novelty signal informs the *reported* confidence (calibration / abstain)
+        # but must NOT change the produced adapter -- folding it into the blend weight
+        # shifts retrieval-vs-generation and can lower accuracy on prompts that merely
+        # sit a little farther from the anchors. So the blend uses the model-internal
+        # uncertainty only; novelty is applied to the reported uncertainty afterwards.
         novelty, max_anchor_similarity = self._novelty(embedding)
-        uncertainty = self._apply_novelty(
-            min(1.0, 0.5 * retrieval_uncertainty + 0.5 * generator_uncertainty), novelty
-        )
-        generated_weight = 1.0 - uncertainty
+        blend_uncertainty = min(1.0, 0.5 * retrieval_uncertainty + 0.5 * generator_uncertainty)
+        uncertainty = self._apply_novelty(blend_uncertainty, novelty)
+        generated_weight = 1.0 - blend_uncertainty
         abstained = min_retrieval_score is not None and max_retrieval_score < min_retrieval_score
         shrink = self.ood_shrink_factor if abstained else 1.0
 
@@ -336,9 +340,9 @@ class TrueLoraGenerator:
             if base is None:
                 merged = delta * generated_weight
             elif delta is None:
-                merged = base * uncertainty
+                merged = base * blend_uncertainty
             else:
-                merged = base * uncertainty + delta * generated_weight
+                merged = base * blend_uncertainty + delta * generated_weight
             if base is not None:
                 retrieval_only[name] = self._clip_norm(base * shrink)
             if delta is not None:
@@ -347,6 +351,7 @@ class TrueLoraGenerator:
 
         return {"blended": blended, "retrieval": retrieval_only, "generated": generated_only}, {
             "uncertainty": uncertainty,
+            "blend_uncertainty": blend_uncertainty,
             "retrieval_uncertainty": retrieval_uncertainty,
             "generator_uncertainty": generator_uncertainty,
             "novelty": novelty,
