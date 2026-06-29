@@ -189,6 +189,7 @@ class TrueLoraGenerator:
         encoder=None,
         hyper_kind: str = "flat",
         cond_dim: int = 64,
+        novelty_weight: float = 1.0,
     ) -> None:
         # An explicit encoder (e.g. SemanticTextEncoder) overrides the hashing default
         # and dictates the hypernetwork input width via its reported ``dim``.
@@ -206,6 +207,55 @@ class TrueLoraGenerator:
         self.adapter_bank = adapter_bank
         self.max_tensor_norm = max_tensor_norm
         self.ood_shrink_factor = ood_shrink_factor
+        # Optional distribution anchors (the seen training prompts). When set, a
+        # training-free novelty signal -- distance from the nearest seen prompt --
+        # raises the reported uncertainty so the model knows when a prompt is OOD.
+        self.novelty_weight = novelty_weight
+        self.anchors: torch.Tensor | None = None
+
+    def set_distribution_anchors(self, items) -> None:
+        """Record the seen-prompt distribution for the novelty / OOD signal.
+
+        ``items`` may be embedding tensors, objects with an ``.embedding`` attribute
+        (e.g. :class:`~true_lora.adapter.AdapterSpec`), or raw description strings
+        (encoded on the fly). Anchors are L2-normalized so novelty is a cosine
+        distance. Pass an empty iterable or ``None`` to clear them.
+        """
+        if not items:
+            self.anchors = None
+            return
+        vecs: list[torch.Tensor] = []
+        for item in items:
+            if isinstance(item, torch.Tensor):
+                vec = item
+            elif hasattr(item, "embedding"):
+                vec = item.embedding
+            else:
+                vec = self.encoder.encode(str(item))
+            vec = vec.float()
+            vecs.append(vec / max(float(vec.norm()), 1e-8))
+        self.anchors = torch.stack(vecs) if vecs else None
+
+    def _novelty(self, embedding: torch.Tensor) -> tuple[float, float]:
+        """Return ``(novelty, max_anchor_similarity)`` for a prompt embedding.
+
+        Novelty is ``1 - max cosine similarity`` to the seen-prompt anchors, clamped
+        to ``[0, 1]``. With no anchors set it is ``0`` (``nan`` similarity), so the
+        reported uncertainty is unchanged -- preserving the bankless/retrieval
+        behavior for callers that never register a distribution.
+        """
+        if self.anchors is None or self.anchors.numel() == 0:
+            return 0.0, float("nan")
+        vec = embedding.float()
+        vec = vec / max(float(vec.norm()), 1e-8)
+        sims = self.anchors @ vec
+        max_sim = float(sims.max())
+        novelty = max(0.0, min(1.0, 1.0 - max_sim))
+        return novelty, max_sim
+
+    def _apply_novelty(self, base_uncertainty: float, novelty: float) -> float:
+        """Push uncertainty toward 1 as novelty rises (monotone, bounded)."""
+        return min(1.0, base_uncertainty + (1.0 - base_uncertainty) * novelty * self.novelty_weight)
 
     def generate(
         self,
@@ -238,12 +288,15 @@ class TrueLoraGenerator:
         # alone maps the prompt to a LoRA. Used when no adapter bank is provided.
         if self.adapter_bank is None:
             generated, generator_uncertainty = self.hyper(embedding)
-            uncertainty = min(1.0, generator_uncertainty)
+            novelty, max_anchor_similarity = self._novelty(embedding)
+            uncertainty = self._apply_novelty(min(1.0, generator_uncertainty), novelty)
             generated_only = {name: self._clip_norm(delta) for name, delta in generated.items()}
             report = {
                 "uncertainty": uncertainty,
                 "retrieval_uncertainty": 0.0,
                 "generator_uncertainty": generator_uncertainty,
+                "novelty": novelty,
+                "max_anchor_similarity": max_anchor_similarity,
                 "generated_weight": 1.0,
                 "metric_weight": metric_weight,
                 "max_retrieval_score": float("nan"),
@@ -265,7 +318,10 @@ class TrueLoraGenerator:
         retrieved, retrieval_uncertainty = self.adapter_bank.interpolate_retrieved(retrieved_adapters, retrieval_weights)
         generated, generator_uncertainty = self.hyper(embedding)
 
-        uncertainty = min(1.0, 0.5 * retrieval_uncertainty + 0.5 * generator_uncertainty)
+        novelty, max_anchor_similarity = self._novelty(embedding)
+        uncertainty = self._apply_novelty(
+            min(1.0, 0.5 * retrieval_uncertainty + 0.5 * generator_uncertainty), novelty
+        )
         generated_weight = 1.0 - uncertainty
         abstained = min_retrieval_score is not None and max_retrieval_score < min_retrieval_score
         shrink = self.ood_shrink_factor if abstained else 1.0
@@ -293,6 +349,8 @@ class TrueLoraGenerator:
             "uncertainty": uncertainty,
             "retrieval_uncertainty": retrieval_uncertainty,
             "generator_uncertainty": generator_uncertainty,
+            "novelty": novelty,
+            "max_anchor_similarity": max_anchor_similarity,
             "generated_weight": generated_weight,
             "metric_weight": metric_weight,
             "max_retrieval_score": max_retrieval_score,

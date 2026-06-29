@@ -62,6 +62,7 @@ Training: reconstruction (copy example LoRAs)  │  end-to-end SFT
 - **Conditioned Hypernetwork**: A shared trunk conditioned on `(task, layer, module)` whose parameters scale with the number of *module types*, not the number of layers — ~28× smaller than a flat generator on a 28-layer model
 - **End-to-End SFT**: Train the hypernetwork through a differentiable LoRA application and a real downstream loss, not just weight reconstruction
 - **Calibrated Reliability**: ECE/MCE, risk-coverage/AURC selective prediction, and an OOD abstain path — know when to trust or abstain
+- **Honest Zero-Shot Generalization**: a held-out benchmark that measures the generalization gap *and* whether confidence actually predicts it (calibration linkage), backed by a training-free novelty signal that lowers confidence on unseen prompts
 - **Quality Gating**: Automatically accept/reject adapters based on confidence and reliability thresholds
 - **PEFT Compatible**: Export to standard HuggingFace PEFT format
 - **Reproducibility**: Deterministic generation with seed control
@@ -284,6 +285,53 @@ true-lora gate --adapter generated.pt --reliability-report rel.json \
   --max-ece 0.1 --max-aurc 0.05 --max-selective-risk 0.02
 ```
 
+### Zero-Shot Generalization Benchmark (with calibration linkage)
+
+Text-to-LoRA's headline claim is *zero-shot generalization*: describe a task never
+seen in training and still get a working adapter. The honest way to measure that is
+a held-out split — train on one set of task descriptions, evaluate on disjoint,
+unseen ones — and report the **generalization gap** between them.
+
+True-LoRA goes one step further than just reporting a number. It measures whether
+the model's own confidence **tracks** that gap:
+
+- **calibration linkage** — on unseen tasks, does higher confidence really predict
+  lower loss? (Pearson correlation of confidence vs. `-loss`; toward +1 is better.)
+- **honesty gap** — does the model lower its confidence on unseen descriptions
+  relative to seen ones, i.e. does it *know* they are harder?
+- **selective generalization** — answer only the most confident unseen tasks and
+  watch the residual risk fall.
+
+A learned variance head alone is nearly constant and cannot do this, so the
+generator carries a **training-free novelty signal**: register the seen prompts as
+distribution anchors and the reported uncertainty rises with cosine distance from
+the nearest anchor. Unseen-but-near prompts stay confident; genuinely out-of-distribution
+prompts get low confidence — which is exactly what makes the linkage positive.
+
+```python
+from true_lora import TrueLoraGenerator, run_zero_shot_benchmark
+
+model = TrueLoraGenerator(specs, adapter_bank=None, hyper_kind="conditioned")
+report = run_zero_shot_benchmark(model, adapters, holdout_fraction=0.3, train_steps=300)
+
+print(report["generalization_gap"])    # seen vs. unseen loss gap
+print(report["calibration_linkage"])   # does confidence predict the gap? (toward +1)
+print(report["honesty_gap"])           # confidence drop on unseen tasks (>0 = honest)
+print(report["honest"])                # True when both signals line up
+```
+
+`run_zero_shot_benchmark` splits the tasks, trains on the seen split only, registers
+the seen prompts as anchors, then scores both splits. For a pre-split, pre-trained
+model use `zero_shot_benchmark(model, train_adapters, heldout_adapters)` directly,
+and `model.set_distribution_anchors(seen_prompts)` to enable the novelty signal.
+
+From the CLI:
+
+```bash
+true-lora zero-shot --manifest adapters.jsonl --holdout-fraction 0.3 \
+  --train-steps 300 --report-out zeroshot.json
+```
+
 ### End-to-End SFT (train through a real downstream loss)
 
 Reconstruction (`train_on_adapter_bank`) teaches the hypernetwork to *copy* example
@@ -357,7 +405,8 @@ true-lora/
 │   ├── sft.py               # End-to-end SFT (differentiable LoRA application)
 │   ├── text.py              # Text encoding (hashing + semantic encoder)
 │   ├── toy_eval.py          # Toy evaluation tasks
-│   └── train.py             # Reconstruction training loop and evaluation
+│   ├── train.py             # Reconstruction training loop and evaluation
+│   └── zeroshot.py          # Zero-shot generalization benchmark + calibration linkage
 ├── tests/
 │   ├── test_true_lora.py    # Unit tests
 │   └── smoke.py             # Integration smoke tests

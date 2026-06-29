@@ -26,6 +26,7 @@ from true_lora.peft_io import inspect_peft_directory
 from true_lora.quality import QualityGate, gate_adapter
 from true_lora.reliability import reliability_report_for_adapters
 from true_lora.repro import set_seed
+from true_lora.zeroshot import run_zero_shot_benchmark
 from true_lora.reporting import (
     audit_reports,
     compare_reports,
@@ -551,6 +552,46 @@ def reliability(args: argparse.Namespace) -> None:
     print(payload)
 
 
+def zero_shot(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    encoder = HashingTextEncoder(dim=args.text_dim)
+    specs, _bank, adapters = load_adapter_manifest(args.manifest, encoder)
+    # Bankless, conditioned hypernetwork: pure text-to-LoRA is what we measure the
+    # zero-shot generalization of. Anchors from the seen split are set internally.
+    model = TrueLoraGenerator(
+        specs,
+        adapter_bank=None,
+        text_dim=args.text_dim,
+        hidden_dim=args.hidden_dim,
+        max_tensor_norm=args.max_norm,
+        encoder=encoder,
+        hyper_kind="conditioned",
+    )
+    report = run_zero_shot_benchmark(
+        model,
+        adapters,
+        holdout_fraction=args.holdout_fraction,
+        seed=args.seed if args.seed is not None else 0,
+        train_steps=args.train_steps,
+        lr=args.lr,
+        tolerance=args.tolerance,
+        calibrate=not args.no_calibrate,
+    )
+    # Drop the bulky curves/records for the printed summary; keep the headline numbers.
+    headline = {
+        "generalization_gap": report["generalization_gap"],
+        "calibration_linkage": report["calibration_linkage"],
+        "honesty_gap": report["honesty_gap"],
+        "heldout_aurc": report["heldout_aurc"],
+        "honest": report["honest"],
+        "train_mean_loss": report["train"]["mean_loss"],
+        "heldout_mean_loss": report["heldout"]["mean_loss"],
+    }
+    payload = {"command": "zero-shot", "manifest": args.manifest, "seed": args.seed, "report": report}
+    maybe_write_report(args.report_out, payload)
+    print({"command": "zero-shot", "headline": headline, "split": report["split"]})
+
+
 def pipeline(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     text_dim = checkpoint_text_dim(args.checkpoint, args.text_dim)
@@ -909,6 +950,20 @@ def main() -> None:
     reliability_parser.add_argument("--seed", type=int)
     reliability_parser.add_argument("--report-out", type=Path)
     reliability_parser.set_defaults(func=reliability)
+
+    zero_shot_parser = sub.add_parser("zero-shot")
+    zero_shot_parser.add_argument("--manifest", type=Path, required=True)
+    zero_shot_parser.add_argument("--holdout-fraction", type=float, default=0.3)
+    zero_shot_parser.add_argument("--train-steps", type=int, default=200)
+    zero_shot_parser.add_argument("--lr", type=float, default=1e-2)
+    zero_shot_parser.add_argument("--tolerance", type=float, default=0.05)
+    zero_shot_parser.add_argument("--text-dim", type=int, default=256)
+    zero_shot_parser.add_argument("--hidden-dim", type=int, default=512)
+    zero_shot_parser.add_argument("--max-norm", type=float, default=8.0)
+    zero_shot_parser.add_argument("--no-calibrate", action="store_true")
+    zero_shot_parser.add_argument("--seed", type=int)
+    zero_shot_parser.add_argument("--report-out", type=Path)
+    zero_shot_parser.set_defaults(func=zero_shot)
 
     pipeline_parser = sub.add_parser("pipeline")
     pipeline_parser.add_argument("--manifest", type=Path, required=True)

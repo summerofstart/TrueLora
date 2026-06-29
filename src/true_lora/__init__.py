@@ -35,6 +35,12 @@ from true_lora.sft import LoraSFTModel, causal_lm_loss, sft_train_hypernetwork
 from true_lora.reporting import audit_reports, compare_reports, load_audit_profile, load_json_report, write_json_report
 from true_lora.sensitivity import PromptContrast, load_prompt_contrasts, prompt_sensitivity_report
 from true_lora.train import ablation_report, train_on_adapter_bank
+from true_lora.zeroshot import (
+    pearson_correlation,
+    run_zero_shot_benchmark,
+    split_adapters_by_description,
+    zero_shot_benchmark,
+)
 
 __all__ = [
     "AdapterBank",
@@ -90,4 +96,8 @@ __all__ = [
     "LoraSFTModel",
     "sft_train_hypernetwork",
     "causal_lm_loss",
+    "split_adapters_by_description",
+    "pearson_correlation",
+    "zero_shot_benchmark",
+    "run_zero_shot_benchmark",
 ]

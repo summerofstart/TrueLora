@@ -19,6 +19,12 @@ from true_lora.reliability import (
 )
 from true_lora.text import HashingTextEncoder, SemanticTextEncoder
 from true_lora.train import train_on_adapter_bank
+from true_lora.zeroshot import (
+    pearson_correlation,
+    run_zero_shot_benchmark,
+    split_adapters_by_description,
+    zero_shot_benchmark,
+)
 
 
 def make_bank():
@@ -286,3 +292,107 @@ def test_reliability_report_for_adapters_bridges_generator():
     assert 0.0 <= report["selective_risk"]["coverage_0.8"]
     assert "abstention" in report
     assert len(report["records"]) == len(adapters)
+
+
+def make_task_adapters(specs, encoder, descriptions):
+    # Each task gets distinct target tensors keyed off a per-task scale, so the
+    # hypernetwork must actually learn a description -> weights mapping.
+    adapters = []
+    for idx, desc in enumerate(descriptions):
+        scale = 0.1 + 0.1 * idx
+        tensors = {}
+        for spec in specs:
+            tensors[f"{spec.name}.lora_A.weight"] = torch.full(spec.a_shape, scale)
+            tensors[f"{spec.name}.lora_B.weight"] = torch.full(spec.b_shape, -scale / 2)
+        adapters.append(AdapterSpec(desc, encoder.encode(desc), tensors, metrics={"score": 0.5}))
+    return adapters
+
+
+def test_pearson_correlation_handles_perfect_and_degenerate():
+    import math
+
+    assert abs(pearson_correlation([1, 2, 3], [2, 4, 6]) - 1.0) < 1e-9
+    assert abs(pearson_correlation([1, 2, 3], [6, 4, 2]) + 1.0) < 1e-9
+    assert math.isnan(pearson_correlation([1, 1, 1], [1, 2, 3]))  # zero variance
+    assert math.isnan(pearson_correlation([5.0], [5.0]))          # <2 points
+
+
+def test_split_holds_out_distinct_descriptions():
+    encoder = HashingTextEncoder(dim=32)
+    specs = make_gqa_specs([0])
+    descriptions = ["alpha task", "beta task", "gamma task", "delta task"]
+    adapters = make_task_adapters(specs, encoder, descriptions)
+    train, heldout = split_adapters_by_description(adapters, holdout_fraction=0.25, seed=1)
+
+    train_desc = {a.description for a in train}
+    heldout_desc = {a.description for a in heldout}
+    assert train_desc.isdisjoint(heldout_desc)  # no leakage
+    assert train_desc | heldout_desc == set(descriptions)
+    assert len(heldout) == 1 and len(train) == 3
+
+
+def test_zero_shot_benchmark_reports_gap_and_calibration_linkage():
+    import math
+
+    torch.manual_seed(0)
+    encoder = HashingTextEncoder(dim=64)
+    specs = make_gqa_specs([0, 6])
+    descriptions = [
+        "python code generation", "japanese translation", "math reasoning",
+        "creative storytelling", "sql query writing", "image captioning",
+    ]
+    adapters = make_task_adapters(specs, encoder, descriptions)
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=64, hidden_dim=64, max_tensor_norm=8.0,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    report = run_zero_shot_benchmark(
+        model, adapters, holdout_fraction=0.34, seed=0,
+        train_steps=120, lr=1e-2, tolerance=0.05,
+    )
+
+    # The held-out descriptions never appeared in training.
+    assert set(report["split"]["train_descriptions"]).isdisjoint(
+        report["split"]["heldout_descriptions"]
+    )
+    # Core generalization measurement: seen tasks fit better than unseen ones.
+    assert report["heldout"]["mean_loss"] >= report["train"]["mean_loss"] - 1e-6
+    assert math.isfinite(report["generalization_gap"])
+    # Calibration linkage is a correlation in [-1, 1] (or nan if degenerate).
+    linkage = report["calibration_linkage"]
+    assert math.isnan(linkage) or -1.0 <= linkage <= 1.0
+    # Reliability suite is computed on the held-out split.
+    assert "ece" in report["reliability"] and "aurc" in report["reliability"]
+    assert "coverage_0.5" in report["selective_generalization"]
+    # Records are tagged by split and cover every task.
+    assert {r["split"] for r in report["records"]} == {"train", "heldout"}
+    assert len(report["records"]) == len(descriptions)
+    assert isinstance(report["honest"], bool)
+
+
+def test_distribution_anchors_lower_confidence_on_ood():
+    encoder = HashingTextEncoder(dim=64)
+    specs = make_gqa_specs([0])
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=64, hidden_dim=32,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    seen = ["python code generation", "japanese translation"]
+    model.set_distribution_anchors(seen)
+
+    _, seen_report = model.generate(seen[0])
+    _, ood_report = model.generate("quantum chromodynamics lattice gauge theory zzz")
+
+    # A seen prompt sits exactly on an anchor -> ~zero novelty, full-strength confidence.
+    assert seen_report["novelty"] < 1e-5
+    # An unrelated prompt is far from every anchor -> higher novelty -> lower confidence.
+    assert ood_report["novelty"] > seen_report["novelty"]
+    assert (1.0 - ood_report["uncertainty"]) <= (1.0 - seen_report["uncertainty"])
+    assert 0.0 <= ood_report["max_anchor_similarity"] <= 1.0 + 1e-6
+
+    # Clearing the anchors restores the original no-novelty behavior.
+    model.set_distribution_anchors(None)
+    _, cleared = model.generate("quantum chromodynamics lattice gauge theory zzz")
+    assert cleared["novelty"] == 0.0
+    import math
+    assert math.isnan(cleared["max_anchor_similarity"])
