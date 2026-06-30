@@ -132,13 +132,18 @@ def zero_shot_benchmark(
     n_bins: int = 10,
     coverages: Sequence[float] = (0.5, 0.8, 1.0),
     calibrate: bool = True,
+    ensemble: int = 1,
+    ensemble_noise: float = 0.05,
+    ensemble_seed: int = 0,
 ) -> dict[str, object]:
     """Score a *already-trained* generator on seen vs. unseen descriptions.
 
     The model must have been trained on ``train_adapters`` only;
     ``heldout_adapters`` are the unseen descriptions. Returns the generalization
     gap plus the calibration-linkage metrics that say whether confidence predicts
-    that gap.
+    that gap. Set ``ensemble > 1`` to score with test-time ensemble generation: its
+    disagreement-based epistemic signal typically lifts the calibration linkage far
+    above the single-forward learned-variance head.
     """
     if not train_adapters or not heldout_adapters:
         raise ValueError("need both train and heldout adapters")
@@ -151,6 +156,9 @@ def zero_shot_benchmark(
         retrieval_metric=retrieval_metric,
         metric_weight=metric_weight,
         min_retrieval_score=min_retrieval_score,
+        ensemble=ensemble,
+        ensemble_noise=ensemble_noise,
+        ensemble_seed=ensemble_seed,
     )
     train_records = score(train_adapters)
     heldout_records = score(heldout_adapters)

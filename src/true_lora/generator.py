@@ -124,19 +124,6 @@ class ConditionedHyperAdapter(nn.Module):
             out = math.prod(a_shape) + math.prod(b_shape)
             self.heads[self._safe(key)] = nn.Linear(hidden_dim, out * 2)
 
-        # Per-spec decode metadata + batched conditioning indices.
-        self._specs_meta: list[tuple[str, str, tuple[int, ...], tuple[int, ...], int, int]] = []
-        for spec in tensor_specs:
-            self._specs_meta.append(
-                (
-                    spec.name,
-                    self._safe(module_key(spec.name)),
-                    spec.a_shape,
-                    spec.b_shape,
-                    math.prod(spec.a_shape),
-                    math.prod(spec.b_shape),
-                )
-            )
         self.register_buffer(
             "_layer_idx",
             torch.tensor([self.layer_to_idx[layer_index(s.name)] for s in tensor_specs], dtype=torch.long),
@@ -145,6 +132,30 @@ class ConditionedHyperAdapter(nn.Module):
             "_module_idx",
             torch.tensor([self.module_to_idx[module_key(s.name)] for s in tensor_specs], dtype=torch.long),
         )
+
+        # Group spec indices by their decode head. Every spec sharing a module key
+        # shares both the head *and* a single A/B shape (enforced above), so each head
+        # can decode all of its layers in one batched matmul instead of one-row-at-a-
+        # time. On a deep model this collapses hundreds of per-spec Linear calls into a
+        # handful of (#module-types) batched calls. Index buffers are registered so they
+        # ride along with ``.to(device)``.
+        groups: dict[str, list[int]] = {}
+        for i, spec in enumerate(tensor_specs):
+            groups.setdefault(self._safe(module_key(spec.name)), []).append(i)
+        self._head_groups: list[tuple[str, str, tuple[int, ...], tuple[int, ...], int, int]] = []
+        for gi, (safe, idxs) in enumerate(groups.items()):
+            first = tensor_specs[idxs[0]]
+            a_shape, b_shape = first.a_shape, first.b_shape
+            buf_name = f"_group_rows_{gi}"
+            self.register_buffer(buf_name, torch.tensor(idxs, dtype=torch.long))
+            self._head_groups.append(
+                (safe, buf_name, a_shape, b_shape, math.prod(a_shape), math.prod(b_shape))
+            )
+        # Spec names indexed exactly as the gathered rows, so decoded blocks map back
+        # to their canonical ``{name}.lora_{A,B}.weight`` keys.
+        self._group_names: list[list[str]] = [
+            [tensor_specs[i].name for i in idxs] for idxs in groups.values()
+        ]
 
     @staticmethod
     def _safe(key: str) -> str:
@@ -162,18 +173,24 @@ class ConditionedHyperAdapter(nn.Module):
         conditioned = torch.cat([task_vec, layer_vec, module_vec], dim=-1)
         latent = self.trunk(conditioned)                     # (S, hidden)
 
+        # Decode one head at a time, but batched over all layers that share it: a
+        # single (rows, hidden) @ headᵀ matmul replaces the per-spec Python loop while
+        # producing numerically identical blocks.
         tensors: dict[str, torch.Tensor] = {}
-        log_vars: list[torch.Tensor] = []
-        for i, (name, safe, a_shape, b_shape, a_numel, b_numel) in enumerate(self._specs_meta):
-            raw = self.heads[safe](latent[i])
+        log_var_means: list[torch.Tensor] = []
+        for gi, (safe, buf_name, a_shape, b_shape, a_numel, b_numel) in enumerate(self._head_groups):
+            rows = getattr(self, buf_name)                   # (G,) long indices
+            raw = self.heads[safe](latent.index_select(0, rows))  # (G, out*2)
             mean, log_var = raw.chunk(2, dim=-1)
-            a = mean[:a_numel].reshape(a_shape)
-            b = mean[a_numel : a_numel + b_numel].reshape(b_shape)
-            tensors[f"{name}.lora_A.weight"] = a
-            tensors[f"{name}.lora_B.weight"] = b
-            log_vars.append(log_var.mean())
+            a_blocks = mean[:, :a_numel].reshape(-1, *a_shape)
+            b_blocks = mean[:, a_numel : a_numel + b_numel].reshape(-1, *b_shape)
+            for j, name in enumerate(self._group_names[gi]):
+                tensors[f"{name}.lora_A.weight"] = a_blocks[j]
+                tensors[f"{name}.lora_B.weight"] = b_blocks[j]
+            log_var_means.append(log_var.mean(dim=-1))       # (G,) one scalar per spec
 
-        uncertainty = float(torch.sigmoid(torch.stack(log_vars).mean()).detach())
+        # Unweighted mean of every spec's log-variance (matches the per-spec form).
+        uncertainty = float(torch.sigmoid(torch.cat(log_var_means).mean()).detach())
         return tensors, uncertainty
 
 
@@ -190,6 +207,7 @@ class TrueLoraGenerator:
         hyper_kind: str = "flat",
         cond_dim: int = 64,
         novelty_weight: float = 1.0,
+        epistemic_scale: float = 50.0,
     ) -> None:
         # An explicit encoder (e.g. SemanticTextEncoder) overrides the hashing default
         # and dictates the hypernetwork input width via its reported ``dim``.
@@ -212,6 +230,9 @@ class TrueLoraGenerator:
         # raises the reported uncertainty so the model knows when a prompt is OOD.
         self.novelty_weight = novelty_weight
         self.anchors: torch.Tensor | None = None
+        # Maps raw ensemble disagreement (a small mean variance) to an epistemic
+        # uncertainty in [0, 1). Larger -> the same disagreement reads as less certain.
+        self.epistemic_scale = epistemic_scale
 
     def set_distribution_anchors(self, items) -> None:
         """Record the seen-prompt distribution for the novelty / OOD signal.
@@ -257,6 +278,65 @@ class TrueLoraGenerator:
         """Push uncertainty toward 1 as novelty rises (monotone, bounded)."""
         return min(1.0, base_uncertainty + (1.0 - base_uncertainty) * novelty * self.novelty_weight)
 
+    def _apply_epistemic(self, base_uncertainty: float, epistemic: float) -> float:
+        """Push uncertainty toward 1 as ensemble disagreement rises (monotone, bounded)."""
+        return min(1.0, base_uncertainty + (1.0 - base_uncertainty) * epistemic)
+
+    def _epistemic_uncertainty(self, disagreement: float) -> float:
+        """Map raw ensemble disagreement (>= 0) to an epistemic uncertainty in [0, 1)."""
+        if disagreement <= 0.0:
+            return 0.0
+        return 1.0 - 1.0 / (1.0 + self.epistemic_scale * disagreement)
+
+    def _hyper_ensemble(
+        self,
+        embedding: torch.Tensor,
+        ensemble: int,
+        noise: float,
+        seed: int,
+    ) -> tuple[dict[str, torch.Tensor], float, float]:
+        """Deep-ensemble-style test-time generation for the hypernetwork component.
+
+        A single forward through a Text-to-LoRA hypernetwork yields a point estimate
+        whose learned variance head is nearly constant -- it cannot say *which* unseen
+        prompts it actually handles. Here we draw ``ensemble`` members by perturbing
+        the prompt embedding with small Gaussian noise (each perturbed prompt is
+        renormalized back onto the encoder's unit sphere), average their LoRA tensors,
+        and read the **cross-member disagreement** as an epistemic uncertainty signal.
+
+        Returns ``(mean_tensors, generator_uncertainty, disagreement)``. With
+        ``ensemble <= 1`` or ``noise <= 0`` it is exactly the single forward pass and a
+        zero disagreement, so the default path is byte-for-byte unchanged. The draw is
+        deterministic in ``seed`` for reproducibility.
+        """
+        base_tensors, base_uncertainty = self.hyper(embedding)
+        if ensemble is None or ensemble <= 1 or noise <= 0.0:
+            return base_tensors, base_uncertainty, 0.0
+
+        sums = {name: tensor.clone() for name, tensor in base_tensors.items()}
+        sq_sums = {name: tensor * tensor for name, tensor in base_tensors.items()}
+        gen = torch.Generator().manual_seed(int(seed))
+        emb = embedding.float()
+        norm = float(emb.norm())
+        for _ in range(ensemble - 1):
+            perturbed = emb + torch.randn(emb.shape, generator=gen) * noise
+            if norm > 0.0:
+                # Keep each member on the same unit sphere the encoder emits, so the
+                # perturbation explores prompt-space rather than rescaling it.
+                perturbed = perturbed / max(float(perturbed.norm()), 1e-8) * norm
+            member, _ = self.hyper(perturbed)
+            for name in sums:
+                sums[name] = sums[name] + member[name]
+                sq_sums[name] = sq_sums[name] + member[name] * member[name]
+
+        mean = {name: total / ensemble for name, total in sums.items()}
+        total_var = 0.0
+        for name in sums:
+            var = (sq_sums[name] / ensemble - mean[name] * mean[name]).clamp_min(0.0).mean()
+            total_var += float(var.detach())
+        disagreement = total_var / len(sums) if sums else 0.0
+        return mean, base_uncertainty, disagreement
+
     def generate(
         self,
         prompt: str,
@@ -264,6 +344,9 @@ class TrueLoraGenerator:
         retrieval_metric: str | None = None,
         metric_weight: float = 0.0,
         min_retrieval_score: float | None = None,
+        ensemble: int = 1,
+        ensemble_noise: float = 0.05,
+        ensemble_seed: int = 0,
     ) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
         components, report = self.generate_components(
             prompt,
@@ -271,6 +354,9 @@ class TrueLoraGenerator:
             retrieval_metric=retrieval_metric,
             metric_weight=metric_weight,
             min_retrieval_score=min_retrieval_score,
+            ensemble=ensemble,
+            ensemble_noise=ensemble_noise,
+            ensemble_seed=ensemble_seed,
         )
         return components["blended"], report
 
@@ -281,20 +367,31 @@ class TrueLoraGenerator:
         retrieval_metric: str | None = None,
         metric_weight: float = 0.0,
         min_retrieval_score: float | None = None,
+        ensemble: int = 1,
+        ensemble_noise: float = 0.05,
+        ensemble_seed: int = 0,
     ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, object]]:
         embedding = self.encoder.encode(prompt)
 
         # Bankless (pure text-to-LoRA) mode: no retrieval database, the hypernetwork
         # alone maps the prompt to a LoRA. Used when no adapter bank is provided.
         if self.adapter_bank is None:
-            generated, generator_uncertainty = self.hyper(embedding)
+            generated, generator_uncertainty, disagreement = self._hyper_ensemble(
+                embedding, ensemble, ensemble_noise, ensemble_seed
+            )
+            epistemic = self._epistemic_uncertainty(disagreement)
             novelty, max_anchor_similarity = self._novelty(embedding)
-            uncertainty = self._apply_novelty(min(1.0, generator_uncertainty), novelty)
+            # Epistemic disagreement and novelty both inform the *reported* confidence;
+            # neither rescales the produced adapter (the mean is the adapter).
+            base_uncertainty = self._apply_epistemic(min(1.0, generator_uncertainty), epistemic)
+            uncertainty = self._apply_novelty(base_uncertainty, novelty)
             generated_only = {name: self._clip_norm(delta) for name, delta in generated.items()}
             report = {
                 "uncertainty": uncertainty,
                 "retrieval_uncertainty": 0.0,
                 "generator_uncertainty": generator_uncertainty,
+                "epistemic": epistemic,
+                "ensemble_size": float(max(1, ensemble)),
                 "novelty": novelty,
                 "max_anchor_similarity": max_anchor_similarity,
                 "generated_weight": 1.0,
@@ -316,16 +413,21 @@ class TrueLoraGenerator:
         )
         max_retrieval_score = float(all_scores.max())
         retrieved, retrieval_uncertainty = self.adapter_bank.interpolate_retrieved(retrieved_adapters, retrieval_weights)
-        generated, generator_uncertainty = self.hyper(embedding)
+        generated, generator_uncertainty, disagreement = self._hyper_ensemble(
+            embedding, ensemble, ensemble_noise, ensemble_seed
+        )
+        epistemic = self._epistemic_uncertainty(disagreement)
 
-        # The novelty signal informs the *reported* confidence (calibration / abstain)
-        # but must NOT change the produced adapter -- folding it into the blend weight
-        # shifts retrieval-vs-generation and can lower accuracy on prompts that merely
-        # sit a little farther from the anchors. So the blend uses the model-internal
-        # uncertainty only; novelty is applied to the reported uncertainty afterwards.
+        # The novelty and epistemic signals inform the *reported* confidence
+        # (calibration / abstain) but must NOT change the produced adapter -- folding
+        # them into the blend weight shifts retrieval-vs-generation and can lower
+        # accuracy on prompts that merely sit a little farther from the anchors. So the
+        # blend uses the model-internal uncertainty only; novelty and epistemic
+        # disagreement are applied to the reported uncertainty afterwards.
         novelty, max_anchor_similarity = self._novelty(embedding)
         blend_uncertainty = min(1.0, 0.5 * retrieval_uncertainty + 0.5 * generator_uncertainty)
-        uncertainty = self._apply_novelty(blend_uncertainty, novelty)
+        reported_base = self._apply_epistemic(blend_uncertainty, epistemic)
+        uncertainty = self._apply_novelty(reported_base, novelty)
         generated_weight = 1.0 - blend_uncertainty
         abstained = min_retrieval_score is not None and max_retrieval_score < min_retrieval_score
         shrink = self.ood_shrink_factor if abstained else 1.0
@@ -354,6 +456,8 @@ class TrueLoraGenerator:
             "blend_uncertainty": blend_uncertainty,
             "retrieval_uncertainty": retrieval_uncertainty,
             "generator_uncertainty": generator_uncertainty,
+            "epistemic": epistemic,
+            "ensemble_size": float(max(1, ensemble)),
             "novelty": novelty,
             "max_anchor_similarity": max_anchor_similarity,
             "generated_weight": generated_weight,

@@ -222,6 +222,107 @@ def test_bankless_generation_uses_hypernetwork_only():
     assert 0.0 <= report["uncertainty"] <= 1.0
 
 
+def test_ensemble_off_matches_single_forward():
+    # Default (ensemble=1) must be byte-for-byte the old single-forward behavior.
+    encoder = HashingTextEncoder(dim=32)
+    specs = make_gqa_specs([0, 6])
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=32, hidden_dim=32, max_tensor_norm=4.0,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    base, base_rep = model.generate("python code generation")
+    same, same_rep = model.generate("python code generation", ensemble=1)
+    assert set(base) == set(same)
+    for key in base:
+        assert torch.equal(base[key], same[key])
+    assert base_rep["uncertainty"] == same_rep["uncertainty"]
+    assert base_rep["epistemic"] == 0.0
+    assert base_rep["ensemble_size"] == 1.0
+
+
+def test_ensemble_zero_noise_is_identity():
+    # With no perturbation every member is the same forward, so the averaged adapter
+    # equals the single forward and disagreement is zero.
+    encoder = HashingTextEncoder(dim=32)
+    specs = make_gqa_specs([0, 6])
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=32, hidden_dim=32, max_tensor_norm=4.0,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    base, _ = model.generate("python code generation")
+    pooled, rep = model.generate("python code generation", ensemble=8, ensemble_noise=0.0)
+    for key in base:
+        assert torch.allclose(base[key], pooled[key], atol=1e-6)
+    assert rep["epistemic"] == 0.0
+
+
+def test_ensemble_produces_epistemic_signal_and_is_deterministic():
+    encoder = HashingTextEncoder(dim=32)
+    specs = make_gqa_specs([0, 6, 12])
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=32, hidden_dim=32, max_tensor_norm=0.5,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    single, single_rep = model.generate("python code generation")
+    a, rep_a = model.generate("python code generation", ensemble=8, ensemble_noise=0.1)
+    b, rep_b = model.generate("python code generation", ensemble=8, ensemble_noise=0.1)
+
+    # A real epistemic signal appears and raises the reported uncertainty.
+    assert rep_a["epistemic"] > 0.0
+    assert rep_a["ensemble_size"] == 8.0
+    assert rep_a["uncertainty"] >= single_rep["uncertainty"] - 1e-9
+    # Shapes are preserved and the norm clip still holds on the averaged adapter.
+    assert a["model.layers.0.self_attn.v_proj.lora_B.weight"].shape == (4, 4)
+    assert all(tensor.norm() <= 0.5001 for tensor in a.values())
+    # Deterministic in the seed: same prompt + settings -> identical adapter.
+    for key in a:
+        assert torch.equal(a[key], b[key])
+    assert rep_a["epistemic"] == rep_b["epistemic"]
+
+
+def test_ensemble_improves_calibration_linkage_on_unseen_tasks():
+    # The headline claim: ensemble disagreement gives Text-to-LoRA a confidence that
+    # actually tracks the generalization gap, where the single-forward variance head
+    # does not. Same trained model, scored two ways.
+    torch.manual_seed(0)
+    encoder = HashingTextEncoder(dim=64)
+    specs = make_gqa_specs([0, 6, 12])
+    descriptions = [f"task alpha {i}" for i in range(6)] + [f"domain beta {i}" for i in range(6)]
+    # Distinct random adapters (real LoRAs differ structurally, not just by a scalar).
+    gen = torch.Generator().manual_seed(0)
+    adapters = []
+    for idx, desc in enumerate(descriptions):
+        scale = 0.1 + 0.05 * idx
+        tensors = {}
+        for spec in specs:
+            tensors[f"{spec.name}.lora_A.weight"] = torch.randn(spec.a_shape, generator=gen) * scale
+            tensors[f"{spec.name}.lora_B.weight"] = torch.randn(spec.b_shape, generator=gen) * scale
+        adapters.append(AdapterSpec(desc, encoder.encode(desc), tensors, metrics={"score": 0.5}))
+    train, heldout = split_adapters_by_description(adapters, holdout_fraction=0.34, seed=0)
+    model = TrueLoraGenerator(
+        specs, adapter_bank=None, text_dim=64, hidden_dim=64, max_tensor_norm=8.0,
+        encoder=encoder, hyper_kind="conditioned",
+    )
+    train_on_adapter_bank(model, train, steps=300, lr=1e-2)
+
+    single = zero_shot_benchmark(model, train, heldout, tolerance=0.05, ensemble=1)
+    ens = zero_shot_benchmark(
+        model, train, heldout, tolerance=0.05, ensemble=9, ensemble_noise=0.05,
+    )
+
+    # Ensemble confidence ranks unseen tasks by quality; the variance head does not.
+    assert ens["calibration_linkage"] > single["calibration_linkage"]
+    assert ens["calibration_linkage"] > 0.3
+    # Selective generation at 50% coverage answers the better half -> lower risk.
+    assert (
+        ens["selective_generalization"]["coverage_0.5"]
+        <= ens["selective_generalization"]["coverage_1.0"] + 1e-9
+    )
+    # Honest: the produced adapter quality is essentially unchanged (no free lunch on
+    # MSE -- the win is in the uncertainty, not the point estimate).
+    assert abs(ens["heldout"]["mean_loss"] - single["heldout"]["mean_loss"]) < 0.02
+
+
 def test_semantic_encoder_interface():
     encoder = SemanticTextEncoder(fallback_dim=48)
     vector = encoder.encode("python code generation")

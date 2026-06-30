@@ -576,6 +576,8 @@ def zero_shot(args: argparse.Namespace) -> None:
         lr=args.lr,
         tolerance=args.tolerance,
         calibrate=not args.no_calibrate,
+        ensemble=args.ensemble,
+        ensemble_noise=args.ensemble_noise,
     )
     # Drop the bulky curves/records for the printed summary; keep the headline numbers.
     headline = {
@@ -589,7 +591,7 @@ def zero_shot(args: argparse.Namespace) -> None:
     }
     payload = {"command": "zero-shot", "manifest": args.manifest, "seed": args.seed, "report": report}
     maybe_write_report(args.report_out, payload)
-    print({"command": "zero-shot", "headline": headline, "split": report["split"]})
+    print({"command": "zero-shot", "ensemble": args.ensemble, "headline": headline, "split": report["split"]})
 
 
 def pipeline(args: argparse.Namespace) -> None:
@@ -961,6 +963,14 @@ def main() -> None:
     zero_shot_parser.add_argument("--hidden-dim", type=int, default=512)
     zero_shot_parser.add_argument("--max-norm", type=float, default=8.0)
     zero_shot_parser.add_argument("--no-calibrate", action="store_true")
+    zero_shot_parser.add_argument(
+        "--ensemble", type=int, default=1,
+        help="Test-time ensemble size; >1 enables disagreement-based epistemic confidence",
+    )
+    zero_shot_parser.add_argument(
+        "--ensemble-noise", type=float, default=0.05,
+        help="Std of the prompt-embedding perturbation for ensemble members",
+    )
     zero_shot_parser.add_argument("--seed", type=int)
     zero_shot_parser.add_argument("--report-out", type=Path)
     zero_shot_parser.set_defaults(func=zero_shot)
