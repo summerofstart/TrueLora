@@ -234,12 +234,17 @@ def collect_generation_records(
     retrieval_metric: str | None = None,
     metric_weight: float = 0.0,
     min_retrieval_score: float | None = None,
+    ensemble: int = 1,
+    ensemble_noise: float = 0.05,
+    ensemble_seed: int = 0,
 ) -> list[dict[str, object]]:
     """Score the generator over a bank, producing per-adapter reliability records.
 
     Confidence is ``1 - uncertainty``; risk is the reconstruction MSE between the
     generated and target adapter; an example counts as ``correct`` when its MSE is
-    within ``tolerance``.
+    within ``tolerance``. Set ``ensemble > 1`` to score with test-time ensemble
+    generation, whose disagreement-based epistemic signal feeds the reported
+    confidence.
     """
     records: list[dict[str, object]] = []
     with torch.no_grad():
@@ -250,6 +255,9 @@ def collect_generation_records(
                 retrieval_metric=retrieval_metric,
                 metric_weight=metric_weight,
                 min_retrieval_score=min_retrieval_score,
+                ensemble=ensemble,
+                ensemble_noise=ensemble_noise,
+                ensemble_seed=ensemble_seed,
             )
             total = 0.0
             count = 0
@@ -268,6 +276,7 @@ def collect_generation_records(
                     "source": adapter.source,
                     "confidence": 1.0 - uncertainty,
                     "uncertainty": uncertainty,
+                    "epistemic": float(report.get("epistemic", 0.0)),
                     "loss": mse,
                     "correct": 1.0 if mse <= tolerance else 0.0,
                     "abstained": float(report.get("abstained", 0.0)),

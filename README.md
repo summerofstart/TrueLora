@@ -63,6 +63,7 @@ Training: reconstruction (copy example LoRAs)  │  end-to-end SFT
 - **End-to-End SFT**: Train the hypernetwork through a differentiable LoRA application and a real downstream loss, not just weight reconstruction
 - **Calibrated Reliability**: ECE/MCE, risk-coverage/AURC selective prediction, and an OOD abstain path — know when to trust or abstain
 - **Honest Zero-Shot Generalization**: a held-out benchmark that measures the generalization gap *and* whether confidence actually predicts it (calibration linkage), backed by a training-free novelty signal that lowers confidence on unseen prompts
+- **Test-Time Ensemble Epistemics**: a deep-ensemble-style signal that generates several adapters from perturbed prompt embeddings and reads their disagreement as confidence — turning a near-useless single-forward variance head into a confidence that genuinely ranks unseen tasks (calibration linkage **−0.09 → +0.68**), with no change to the produced adapter's quality
 - **Quality Gating**: Automatically accept/reject adapters based on confidence and reliability thresholds
 - **PEFT Compatible**: Export to standard HuggingFace PEFT format
 - **Reproducibility**: Deterministic generation with seed control
@@ -340,6 +341,54 @@ From the CLI:
 ```bash
 true-lora zero-shot --manifest adapters.jsonl --holdout-fraction 0.3 \
   --train-steps 300 --report-out zeroshot.json
+```
+
+### Test-Time Ensemble Epistemics (knowing *which* unseen tasks it handles)
+
+A plain Text-to-LoRA hypernetwork generates a LoRA in one forward pass and reports a
+learned variance head as its confidence. That head is nearly constant, so on unseen
+tasks it has essentially **zero (even negative) calibration linkage** — selective
+generation on its confidence can be *worse* than answering everything.
+
+True-LoRA adds a training-free, deep-ensemble-style alternative. At inference it draws
+several members by perturbing the prompt embedding with small Gaussian noise (each
+renormalized back onto the encoder's unit sphere), averages their LoRA tensors, and
+reads the **cross-member disagreement** as an epistemic uncertainty. Disagreement is
+high exactly where the hypernetwork is extrapolating — i.e. on genuinely novel
+prompts — so the reported confidence finally tracks the generalization gap. It needs
+no anchors and composes with the novelty signal; the disagreement informs the
+*reported* confidence only and never rescales the produced adapter.
+
+On the held-out zero-shot benchmark (bankless conditioned hypernetwork, averaged over
+10 seeds — reproduce with `python experiments/ensemble_epistemic.py`):
+
+| Variant | Held-out MSE | Calibration linkage | Selective risk @50% | Risk @100% |
+|---------|-------------:|--------------------:|--------------------:|-----------:|
+| Single forward (T2L variance head) | 0.1937 | **−0.09** | 0.208 | 0.194 |
+| Test-time ensemble (disagreement)  | 0.1936 | **+0.68** | **0.118** | 0.194 |
+
+The adapter quality (held-out MSE) is unchanged — there is no free lunch on the point
+estimate. The win is a confidence that ranks unseen tasks by quality, so abstaining on
+the least-confident half cuts selective risk by ~40%.
+
+```python
+from true_lora import TrueLoraGenerator, zero_shot_benchmark
+
+model = TrueLoraGenerator(specs, adapter_bank=None, hyper_kind="conditioned")
+# ... train on the seen split ...
+state_dict, report = model.generate(
+    "explain CRISPR base editing", ensemble=9, ensemble_noise=0.05
+)
+print(report["epistemic"])   # disagreement-based epistemic uncertainty in [0, 1)
+
+# Or score a whole held-out split with ensemble confidence:
+ens = zero_shot_benchmark(model, train_adapters, heldout_adapters, ensemble=9)
+print(ens["calibration_linkage"])   # confidence now tracks the generalization gap
+```
+
+```bash
+true-lora zero-shot --manifest adapters.jsonl --holdout-fraction 0.3 \
+  --train-steps 300 --ensemble 9 --ensemble-noise 0.05 --report-out zeroshot.json
 ```
 
 ### End-to-End SFT (train through a real downstream loss)
