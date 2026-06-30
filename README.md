@@ -210,6 +210,14 @@ True-LoRA includes several performance optimizations:
 - Uses `torch.stack` and matrix multiplication for adapter blending
 - Eliminates per-tensor Python loop overhead
 
+### 7. Batched Conditioned-Head Decoding
+- The conditioned hypernetwork groups LoRA tensors by module type and decodes every
+  layer that shares a head in a single batched matmul, instead of one Python-level
+  `nn.Linear` call per tensor
+- Collapses hundreds of per-spec calls into a handful (one per module type) on deep
+  models — **~9× faster generation on a 28-layer model** — while producing
+  byte-for-byte identical adapters
+
 ## Benchmark Results
 
 Performance on GPT-2 (124M parameters):
