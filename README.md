@@ -2,7 +2,6 @@
 
 **Reliable, Uncertainty-Aware Text-to-LoRA Generation**
 
-Developed by [MARVserver](https://github.com/MARVserver)
 
 True-LoRA is a framework that generates LoRA (Low-Rank Adaptation) adapters directly from text prompts, enabling on-the-fly model customization without per-task fine-tuning. It runs as pure text-to-LoRA or with optional retrieval grounding, trains by reconstruction or end-to-end SFT, and reports calibrated confidence so you know when to trust — or abstain from — a generated adapter.
 
@@ -503,18 +502,9 @@ true-lora/
 └── README.md                # This file
 ```
 
-## Citation
 
-If you use True-LoRA in your research, please cite:
 
-```bibtex
-@software{truelora2024,
-  title={True-LoRA: Retrieval-Grounded Text-to-LoRA Generation},
-  author={MARVGAME},
-  year={2024},
-  url={https://github.com/MARVserver/TrueLora}
-}
-```
+
 
 ## License
 
